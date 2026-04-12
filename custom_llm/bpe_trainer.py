@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
+import sys
 from collections import Counter, defaultdict
 from typing import Iterable
+
+from tqdm.auto import tqdm
 
 from custom_llm.gpt2_pretokenize import pretokenize
 
@@ -46,10 +49,35 @@ def iter_documents(corpus: str, delimiter: str = EOT_STR) -> Iterable[str]:
             yield p
 
 
-def build_word_freq_from_corpus(corpus: str, delimiter: str = EOT_STR) -> Counter[tuple[int, ...]]:
+def build_word_freq_from_corpus(
+    corpus: str,
+    delimiter: str = EOT_STR,
+    *,
+    show_progress: bool = False,
+) -> Counter[tuple[int, ...]]:
     """Aggregate pretoken byte-tuple counts over all documents."""
     wf: Counter[tuple[int, ...]] = Counter()
-    for doc in iter_documents(corpus, delimiter):
+
+    if show_progress:
+        # ``str.split`` on multi‑GB strings can take minutes before any iterator runs;
+        # split up‑front so we can print status and give tqdm a real total.
+        print(
+            "Splitting corpus on <|endoftext|> (large files: this step alone can take several minutes)...",
+            flush=True,
+        )
+        parts = [p.strip() for p in corpus.split(delimiter) if p.strip()]
+        print(f"Found {len(parts):,} documents — pretokenizing...", flush=True)
+        doc_iter: Iterable[str] = tqdm(
+            parts,
+            desc="Pretokenize corpus",
+            unit="doc",
+            file=sys.stdout,
+            mininterval=0.5,
+        )
+    else:
+        doc_iter = iter_documents(corpus, delimiter)
+
+    for doc in doc_iter:
         for piece in pretokenize(doc):
             if not piece:
                 continue
@@ -63,6 +91,8 @@ def train_bpe_from_word_freq(
     word_freq: dict[tuple[int, ...], int],
     vocab_size: int,
     eot_token_id: int,
+    *,
+    show_progress: bool = False,
 ) -> tuple[list[tuple[int, int]], dict[int, bytes]]:
     """
     Train BPE on pretoken byte-tuple frequencies.
@@ -83,7 +113,18 @@ def train_bpe_from_word_freq(
 
     wf: dict[tuple[int, ...], int] = dict(word_freq)
 
-    for _ in range(num_merges):
+    merge_range = range(num_merges)
+    if show_progress:
+        merge_range = tqdm(
+            merge_range,
+            total=num_merges,
+            desc="BPE merges",
+            unit="merge",
+            file=sys.stdout,
+            mininterval=0.5,
+        )
+
+    for _ in merge_range:
         if next_id >= eot_token_id:
             break
         stats = _get_stats(wf)
@@ -112,7 +153,11 @@ def train_bpe_from_text(
     corpus: str,
     vocab_size: int,
     eot_token_id: int,
+    *,
+    show_progress: bool = False,
 ) -> tuple[list[tuple[int, int]], dict[int, bytes]]:
     """Train BPE on a corpus that uses ``<|endoftext|>`` between documents."""
-    wf = build_word_freq_from_corpus(corpus)
-    return train_bpe_from_word_freq(wf, vocab_size, eot_token_id)
+    wf = build_word_freq_from_corpus(corpus, show_progress=show_progress)
+    return train_bpe_from_word_freq(
+        wf, vocab_size, eot_token_id, show_progress=show_progress
+    )
