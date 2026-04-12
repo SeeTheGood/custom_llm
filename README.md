@@ -77,6 +77,8 @@ python -m custom_llm.train \
 
 Checkpoints: `checkpoints/best.pt` (lowest **held-out** validation loss if `--val_corpus` is set).
 
+**Google Colab / notebook cells:** `!python -m ...` runs in a **non-TTY** subprocess, so `tqdm`’s in-place bar often **does not update until the process finishes**. The trainer detects this and prints **line-based progress** (flushed) every **`--progress_interval`** steps (default **10**). Use **`--force_tqdm`** only if you want the tqdm bar anyway (often still invisible in `!python`). For other buffering issues, **`python -u`** (unbuffered stdout) can help.
+
 **Longer runs toward lower val loss (e.g. ~2.0):** use the **TinyStories train** split for more data (`prepare_tinystories.py --split train`), **retrain or reuse** a tokenizer trained on that text, increase **`--steps`**, and on GPU use `--device cuda`. Optional **`--cosine_decay`** (with **`--min_lr`**) reduces LR over the run and often helps late training. Validation should use a **held-out** file when possible (e.g. train on `train`, eval corpus = `validation`).
 
 **Continue training on the same corpus (no new data):** after a run, `checkpoints/latest.pt` stores weights, optimizer, and global step. Run again with **`--resume checkpoints/latest.pt`**; **`--steps`** is then the number of **additional** optimizer steps. Example: first run `--steps 5000`, then `--resume checkpoints/latest.pt --steps 5000` goes from step 5000 → 10000 on the same `--corpus`.
@@ -102,7 +104,7 @@ Use `--top_p 0.9 --temperature 0.9` for nucleus sampling.
 | `custom_llm/tokenizer.py` | `BPETokenizer` encode/decode + `tokenizer.json` I/O |
 | `custom_llm/model.py` | Causal Transformer + RoPE, weight-tied head |
 | `custom_llm/data.py` | Random sliding windows over token ids |
-| `custom_llm/train.py` | CPU training loop |
+| `custom_llm/train.py` | Training loop (CPU or CUDA) |
 | `custom_llm/sample.py` | Greedy or top-p generation |
 | `custom_llm/pretokenization.py` | Optional parallel chunking for huge files |
 
