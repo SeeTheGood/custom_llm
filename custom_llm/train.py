@@ -4,12 +4,14 @@ from __future__ import annotations
 
 import argparse
 import math
+import sys
 import time
 from pathlib import Path
 
 import torch
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
+from tqdm.auto import tqdm
 
 from custom_llm.data import SlidingWindowDataset
 from custom_llm.model import TransformerConfig, TransformerLM
@@ -30,10 +32,21 @@ def evaluate(
     model: TransformerLM,
     loader: DataLoader,
     device: torch.device,
+    *,
+    show_progress: bool = False,
 ) -> float:
     model.eval()
     losses: list[float] = []
-    for x, y in loader:
+    batches = loader
+    if show_progress:
+        batches = tqdm(
+            loader,
+            desc="Validation",
+            leave=False,
+            file=sys.stdout,
+            mininterval=0.2,
+        )
+    for x, y in batches:
         x = x.to(device)
         y = y.to(device)
         logits = model(x)
@@ -90,20 +103,41 @@ def main() -> None:
         default=1e-5,
         help="LR floor when --cosine_decay is set (default: 1e-5)",
     )
+    p.add_argument(
+        "--no_progress",
+        action="store_true",
+        help="Disable all training progress output except eval lines and every-50-step summary",
+    )
+    p.add_argument(
+        "--progress_interval",
+        type=int,
+        default=10,
+        help="When stdout is not a TTY (e.g. Colab !python), print a line every N steps (default: 10)",
+    )
+    p.add_argument(
+        "--force_tqdm",
+        action="store_true",
+        help="Use tqdm even when stdout is not a TTY (often invisible in Colab; prefer default)",
+    )
     args = p.parse_args()
 
     torch.manual_seed(args.seed)
     device = torch.device(args.device)
 
     tok = BPETokenizer.load(args.tokenizer_dir)
+    print(f"Loading training text: {args.corpus}", flush=True)
     text = load_corpus_text(args.corpus)
+    print("Encoding training corpus to token ids (large files can take a few minutes)...", flush=True)
     token_ids = encode_corpus(tok, text)
+    print(f"Training sequence: {len(token_ids):,} token ids", flush=True)
     if len(token_ids) < args.context_length + 2:
         raise SystemExit("Training corpus is too small after tokenization.")
 
     eval_token_ids = token_ids
     if args.val_corpus is not None:
+        print(f"Loading validation text: {args.val_corpus}", flush=True)
         val_text = load_corpus_text(args.val_corpus)
+        print("Encoding validation corpus to token ids...", flush=True)
         eval_token_ids = encode_corpus(tok, val_text)
         if len(eval_token_ids) < args.context_length + 2:
             raise SystemExit("Validation corpus is too small after tokenization.")
@@ -211,7 +245,32 @@ def main() -> None:
 
     last_val = best_val
 
-    for local_i in range(1, args.steps + 1):
+    # Colab/Jupyter `!python` runs a non-TTY subprocess: tqdm's \\r updates are often buffered
+    # until the process ends. Prefer flushed line prints unless we're in a real terminal.
+    _tty = sys.stdout.isatty()
+    use_tqdm_loop = (not args.no_progress) and (_tty or args.force_tqdm)
+    use_simple_lines = (not args.no_progress) and (not use_tqdm_loop)
+
+    if use_tqdm_loop:
+        train_iter: range | tqdm = tqdm(
+            range(1, args.steps + 1),
+            total=args.steps,
+            desc="Training",
+            unit="step",
+            file=sys.stdout,
+            mininterval=0.1,
+            dynamic_ncols=True,
+        )
+    else:
+        train_iter = range(1, args.steps + 1)
+        if use_simple_lines:
+            print(
+                f"Progress: printing every {args.progress_interval} steps (non-TTY / Colab-friendly). "
+                "Use a real terminal or --force_tqdm for tqdm.",
+                flush=True,
+            )
+
+    for local_i in train_iter:
         step = resume_from + local_i
         for g in opt.param_groups:
             g["lr"] = lr_at_step(step)
@@ -237,20 +296,64 @@ def main() -> None:
         opt.zero_grad(set_to_none=True)
 
         running_loss += loss.item()
+        if use_tqdm_loop:
+            train_iter.set_postfix(
+                batch_loss=f"{loss.item():.3f}",
+                lr=f"{opt.param_groups[0]['lr']:.1e}",
+                step=f"{step}/{global_total}",
+            )
+
+        if use_simple_lines and (
+            local_i % args.progress_interval == 0
+            or local_i == 1
+            or local_i == args.steps
+        ):
+            elapsed = time.time() - t0
+            pct = 100.0 * local_i / args.steps
+            print(
+                f"[train] {local_i}/{args.steps} ({pct:.1f}%)  "
+                f"global_step={step}/{global_total}  loss={loss.item():.4f}  "
+                f"lr={opt.param_groups[0]['lr']:.2e}  elapsed={elapsed/60:.1f}m",
+                flush=True,
+            )
+
         if local_i % 50 == 0:
             avg = running_loss / 50
             running_loss = 0.0
             elapsed = time.time() - t0
-            print(
-                f"step {step}/{global_total}  loss {avg:.4f}  lr {opt.param_groups[0]['lr']:.2e}  "
-                f"elapsed {elapsed/60:.1f}m"
-            )
+            if args.no_progress:
+                print(
+                    f"step {step}/{global_total}  loss {avg:.4f}  lr {opt.param_groups[0]['lr']:.2e}  "
+                    f"elapsed {elapsed/60:.1f}m",
+                    flush=True,
+                )
+            elif use_tqdm_loop:
+                train_iter.set_postfix(
+                    avg50=f"{avg:.4f}",
+                    lr=f"{opt.param_groups[0]['lr']:.2e}",
+                    elapsed_min=f"{elapsed/60:.1f}",
+                    step=f"{step}/{global_total}",
+                )
+            else:
+                print(
+                    f"[train] avg50 @ step {step}: loss={avg:.4f}  lr={opt.param_groups[0]['lr']:.2e}  "
+                    f"elapsed={elapsed/60:.1f}m",
+                    flush=True,
+                )
 
         if step % args.eval_every == 0 or local_i == args.steps:
-            val_loss = evaluate(model, eval_loader, device)
+            if use_simple_lines:
+                print("  (running validation...)", flush=True)
+            val_loss = evaluate(
+                model,
+                eval_loader,
+                device,
+                show_progress=use_tqdm_loop and (not args.no_progress),
+            )
             last_val = val_loss
             val_label = "validation loss (held-out)" if args.val_corpus is not None else "validation loss (train windows)"
-            print(f"  >> {val_label} {val_loss:.4f}")
+            msg = f"  >> {val_label} {val_loss:.4f}"
+            print(msg, flush=True)
             if val_loss < best_val:
                 best_val = val_loss
                 ckpt = {
@@ -274,10 +377,10 @@ def main() -> None:
         },
         args.out_dir / "latest.pt",
     )
-    print(f"Wrote {args.out_dir / 'latest.pt'} (resume with: --resume {args.out_dir / 'latest.pt'})")
+    print(f"Wrote {args.out_dir / 'latest.pt'} (resume with: --resume {args.out_dir / 'latest.pt'})", flush=True)
 
     total_time = time.time() - t0
-    print(f"Done. Best val loss {best_val:.4f}  total time {total_time/60:.1f}m")
+    print(f"Done. Best val loss {best_val:.4f}  total time {total_time/60:.1f}m", flush=True)
 
 
 if __name__ == "__main__":
