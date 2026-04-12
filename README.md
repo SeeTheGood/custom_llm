@@ -64,7 +64,22 @@ python -m custom_llm.train \
   --steps 5000
 ```
 
-Checkpoints: `checkpoints/best.pt` (lowest validation loss seen).
+**Held-out validation (recommended):** prepare `data/tinystories_train.txt` and `data/tinystories_val.txt`, train the tokenizer on **train**, then:
+
+```bash
+python -m custom_llm.train \
+  --corpus data/tinystories_train.txt \
+  --val_corpus data/tinystories_val.txt \
+  --tokenizer_dir tokenizer \
+  --out_dir checkpoints \
+  --device cuda
+```
+
+Checkpoints: `checkpoints/best.pt` (lowest **held-out** validation loss if `--val_corpus` is set).
+
+**Longer runs toward lower val loss (e.g. ~2.0):** use the **TinyStories train** split for more data (`prepare_tinystories.py --split train`), **retrain or reuse** a tokenizer trained on that text, increase **`--steps`**, and on GPU use `--device cuda`. Optional **`--cosine_decay`** (with **`--min_lr`**) reduces LR over the run and often helps late training. Validation should use a **held-out** file when possible (e.g. train on `train`, eval corpus = `validation`).
+
+**Continue training on the same corpus (no new data):** after a run, `checkpoints/latest.pt` stores weights, optimizer, and global step. Run again with **`--resume checkpoints/latest.pt`**; **`--steps`** is then the number of **additional** optimizer steps. Example: first run `--steps 5000`, then `--resume checkpoints/latest.pt --steps 5000` goes from step 5000 → 10000 on the same `--corpus`.
 
 ### 4. Sample
 
