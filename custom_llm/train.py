@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import argparse
+import array
+import gc
 import math
 import sys
 import time
@@ -13,6 +15,7 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader
 from tqdm.auto import tqdm
 
+from custom_llm.bpe_trainer import EOT_STR
 from custom_llm.data import SlidingWindowDataset
 from custom_llm.model import TransformerConfig, TransformerLM
 from custom_llm.tokenizer import BPETokenizer
@@ -24,7 +27,55 @@ def load_corpus_text(path: Path) -> str:
 
 def encode_corpus(tok: BPETokenizer, text: str) -> torch.Tensor:
     ids = tok.encode(text, add_eot_between_docs=True)
-    return torch.tensor(ids, dtype=torch.long)
+    return _ids_to_storage_tensor(ids, tok.vocab_size)
+
+
+def _ids_to_storage_tensor(ids: list[int], vocab_size: int) -> torch.Tensor:
+    """Store token ids in the narrowest dtype that fits ``vocab_size`` (saves RAM on huge corpora)."""
+    if vocab_size <= 65536:
+        # uint16 is enough for default 10k vocab; keeps RAM ~2× lower than int64.
+        for tid in ids:
+            if tid < 0 or tid >= 65536:
+                return torch.tensor(ids, dtype=torch.int32)
+        return torch.tensor(ids, dtype=torch.uint16)
+    return torch.tensor(ids, dtype=torch.int32)
+
+
+def encode_corpus_file_streaming(path: Path, tok: BPETokenizer) -> torch.Tensor:
+    """
+    Stream a plaintext corpus from disk: never holds the full file as one string or Python list of all ids.
+
+    Documents are separated by ``EOT_STR`` (same as ``prepare_tinystories`` output). Token ids are collected in a
+    compact ``array.array`` (type ``H`` when ids fit in uint16), then converted to a tensor.
+    """
+    out_h = array.array("H")
+    buf = ""
+    with path.open("r", encoding="utf-8", errors="replace") as f:
+        while True:
+            chunk = f.read(2 * 1024 * 1024)
+            if not chunk:
+                break
+            buf += chunk
+            while True:
+                i = buf.find(EOT_STR)
+                if i == -1:
+                    break
+                doc = buf[:i].strip()
+                buf = buf[i + len(EOT_STR) :]
+                if doc:
+                    piece = tok.encode(doc, add_eot_between_docs=False)
+                    if piece and max(piece) >= 65536:
+                        raise SystemExit("Token id >= 65536; use --full_ram_encode or smaller vocab.")
+                    out_h.extend(piece)
+                out_h.append(tok.eot_token_id)
+        tail = buf.strip()
+        if tail:
+            piece = tok.encode(tail, add_eot_between_docs=False)
+            if piece and max(piece) >= 65536:
+                raise SystemExit("Token id >= 65536; use --full_ram_encode or smaller vocab.")
+            out_h.extend(piece)
+
+    return torch.tensor(out_h, dtype=torch.uint16)
 
 
 @torch.no_grad()
@@ -47,8 +98,8 @@ def evaluate(
             mininterval=0.2,
         )
     for x, y in batches:
-        x = x.to(device)
-        y = y.to(device)
+        x = x.long().to(device)
+        y = y.long().to(device)
         logits = model(x)
         loss = F.cross_entropy(
             logits.view(-1, logits.size(-1)),
@@ -135,6 +186,11 @@ def main() -> None:
         action="store_true",
         help="Use tqdm even when stdout is not a TTY (often invisible in Colab; prefer default)",
     )
+    p.add_argument(
+        "--full_ram_encode",
+        action="store_true",
+        help="Load each corpus fully into RAM then encode (high memory; default streams from disk for lower RAM).",
+    )
     args = p.parse_args()
 
     torch.manual_seed(args.seed)
@@ -142,19 +198,34 @@ def main() -> None:
 
     tok = BPETokenizer.load(args.tokenizer_dir)
     print(f"Loading training text: {args.corpus}", flush=True)
-    text = load_corpus_text(args.corpus)
-    print("Encoding training corpus to token ids (large files can take a few minutes)...", flush=True)
-    token_ids = encode_corpus(tok, text)
-    print(f"Training sequence: {len(token_ids):,} token ids", flush=True)
+    if args.full_ram_encode:
+        text = load_corpus_text(args.corpus)
+        print("Encoding training corpus to token ids (large files can take a few minutes)...", flush=True)
+        token_ids = encode_corpus(tok, text)
+        del text
+        gc.collect()
+    else:
+        print(
+            "Encoding training corpus (streaming from disk, uint16 storage; use --full_ram_encode for legacy path)...",
+            flush=True,
+        )
+        token_ids = encode_corpus_file_streaming(args.corpus, tok)
+    print(f"Training sequence: {len(token_ids):,} token ids (dtype={token_ids.dtype})", flush=True)
     if len(token_ids) < args.context_length + 2:
         raise SystemExit("Training corpus is too small after tokenization.")
 
     eval_token_ids = token_ids
     if args.val_corpus is not None:
         print(f"Loading validation text: {args.val_corpus}", flush=True)
-        val_text = load_corpus_text(args.val_corpus)
-        print("Encoding validation corpus to token ids...", flush=True)
-        eval_token_ids = encode_corpus(tok, val_text)
+        if args.full_ram_encode:
+            val_text = load_corpus_text(args.val_corpus)
+            print("Encoding validation corpus to token ids...", flush=True)
+            eval_token_ids = encode_corpus(tok, val_text)
+            del val_text
+            gc.collect()
+        else:
+            print("Encoding validation corpus (streaming)...", flush=True)
+            eval_token_ids = encode_corpus_file_streaming(args.val_corpus, tok)
         if len(eval_token_ids) < args.context_length + 2:
             raise SystemExit("Validation corpus is too small after tokenization.")
         print(f"Validation: held-out file {args.val_corpus} ({len(eval_token_ids)} token ids)")
@@ -298,8 +369,8 @@ def main() -> None:
             it = iter(train_loader)
             x, y = next(it)
 
-        x = x.to(device)
-        y = y.to(device)
+        x = x.long().to(device)
+        y = y.long().to(device)
         logits = model(x)
         loss = F.cross_entropy(
             logits.view(-1, logits.size(-1)),
