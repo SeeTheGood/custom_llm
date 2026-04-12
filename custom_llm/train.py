@@ -59,6 +59,16 @@ def evaluate(
     return float(sum(losses) / max(len(losses), 1))
 
 
+def _ascii_progress_bar(current: int, total: int, width: int = 28) -> str:
+    """Single-line bar for non-TTY logs (e.g. Colab ``!python``) where tqdm updates poorly."""
+    if total <= 0:
+        return "[" + "?" * width + "]"
+    frac = min(max(current / total, 0.0), 1.0)
+    filled = int(round(frac * width))
+    filled = min(filled, width)
+    return "[" + "#" * filled + "." * (width - filled) + "]"
+
+
 def main() -> None:
     p = argparse.ArgumentParser(description="Train Transformer LM (CPU or CUDA).")
     p.add_argument("--corpus", type=Path, required=True, help="Training plaintext with <|endoftext|> separators")
@@ -113,6 +123,12 @@ def main() -> None:
         type=int,
         default=10,
         help="When stdout is not a TTY (e.g. Colab !python), print a line every N steps (default: 10)",
+    )
+    p.add_argument(
+        "--bar_width",
+        type=int,
+        default=28,
+        help="Width of the ASCII [###...] bar in non-TTY progress lines (default: 28)",
     )
     p.add_argument(
         "--force_tqdm",
@@ -310,8 +326,9 @@ def main() -> None:
         ):
             elapsed = time.time() - t0
             pct = 100.0 * local_i / args.steps
+            bar = _ascii_progress_bar(local_i, args.steps, width=max(8, args.bar_width))
             print(
-                f"[train] {local_i}/{args.steps} ({pct:.1f}%)  "
+                f"[train] {bar} {pct:5.1f}%  {local_i}/{args.steps}  "
                 f"global_step={step}/{global_total}  loss={loss.item():.4f}  "
                 f"lr={opt.param_groups[0]['lr']:.2e}  elapsed={elapsed/60:.1f}m",
                 flush=True,
@@ -335,9 +352,11 @@ def main() -> None:
                     step=f"{step}/{global_total}",
                 )
             else:
+                bar = _ascii_progress_bar(local_i, args.steps, width=max(8, args.bar_width))
+                pct = 100.0 * local_i / args.steps
                 print(
-                    f"[train] avg50 @ step {step}: loss={avg:.4f}  lr={opt.param_groups[0]['lr']:.2e}  "
-                    f"elapsed={elapsed/60:.1f}m",
+                    f"[train] {bar} {pct:5.1f}%  avg50 @ step {step}: loss={avg:.4f}  "
+                    f"lr={opt.param_groups[0]['lr']:.2e}  elapsed={elapsed/60:.1f}m",
                     flush=True,
                 )
 
