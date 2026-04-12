@@ -20,6 +20,8 @@ Dependencies: PyTorch (CPU), `regex` (Unicode pretokenizer), `datasets` (optiona
 
 Use **`device="cpu"`** everywhere; no CUDA assumptions.
 
+**NumPy:** The package allows **NumPy 1.26+** (including **2.x**). **Google Colab** needs NumPy 2 for many preinstalled libraries (OpenCV, JAX, …). On **older CPU-only PyTorch + macOS**, if you see NumPy/Torch ABI warnings, try: `pip install "numpy>=1.26,<2"`.
+
 ## Milestones (in order)
 
 ### 1. Corpus: TinyStories as one plaintext file
