@@ -17,6 +17,19 @@ from tqdm.auto import tqdm
 EOT = "<|endoftext|>"
 
 
+def _apply_resume(ds, resume: int, streaming: bool):
+    """Skip the first ``resume`` rows (same index as tqdm / Hub order)."""
+    if resume <= 0:
+        return ds
+    if streaming:
+        return ds.skip(resume)
+    # Map-style Dataset: iterate with index (skip() exists on Dataset in recent ``datasets``)
+    sk = getattr(ds, "skip", None)
+    if callable(sk):
+        return ds.skip(resume)
+    return ds.select(range(resume, len(ds)))
+
+
 def main() -> None:
     p = argparse.ArgumentParser(description="Export TinyStories to a single plaintext corpus.")
     p.add_argument(
@@ -36,11 +49,25 @@ def main() -> None:
         help="Download/cache the full split before iterating (needs more RAM; can look 'stuck' on Colab). "
         "Default is streaming: stories arrive incrementally.",
     )
+    p.add_argument(
+        "--resume",
+        type=int,
+        default=0,
+        help="Skip the first N Hub rows and append to --out (use after a network error). "
+        "N must match the tqdm doc count when the run stopped (not the 'non-empty' count).",
+    )
+    p.add_argument(
+        "--flush_every",
+        type=int,
+        default=5000,
+        help="Flush the output file every N rows read (0 = flush only at end). Reduces loss on crash.",
+    )
     args = p.parse_args()
 
     streaming = not args.no_streaming
+    resume = max(0, args.resume)
     print(
-        f"Loading roneneldan/TinyStories split={args.split!r} streaming={streaming} ...",
+        f"Loading roneneldan/TinyStories split={args.split!r} streaming={streaming} resume={resume} ...",
         flush=True,
     )
     ds = load_dataset(
@@ -48,19 +75,57 @@ def main() -> None:
         split=args.split,
         streaming=streaming,
     )
+    ds = _apply_resume(ds, resume, streaming)
     args.out.parent.mkdir(parents=True, exist_ok=True)
-    n = 0
-    with args.out.open("w", encoding="utf-8") as f:
-        for row in tqdm(ds, desc=f"TinyStories {args.split}", unit="doc"):
-            text = (row["text"] or "").strip()
-            if not text:
-                continue
-            f.write(text)
-            f.write("\n\n")
-            f.write(EOT)
-            f.write("\n\n")
-            n += 1
-    print(f"Wrote {args.out} ({args.out.stat().st_size} bytes, {n:,} non-empty docs)", flush=True)
+    mode = "a" if resume > 0 else "w"
+    n_non_empty = 0
+    rows_read = resume
+    try:
+        with args.out.open(mode, encoding="utf-8") as f:
+            it = tqdm(
+                ds,
+                desc=f"TinyStories {args.split}",
+                unit="doc",
+                initial=resume,
+            )
+            for row in it:
+                text = (row["text"] or "").strip()
+                rows_read += 1
+                if not text:
+                    if args.flush_every and rows_read % args.flush_every == 0:
+                        f.flush()
+                    continue
+                f.write(text)
+                f.write("\n\n")
+                f.write(EOT)
+                f.write("\n\n")
+                n_non_empty += 1
+                if args.flush_every and rows_read % args.flush_every == 0:
+                    f.flush()
+    except OSError as e:
+        raise SystemExit(
+            f"Write failed: {e}\nIf this was a download error, re-run with:\n"
+            f"  --resume {rows_read}\n"
+            f"(use the tqdm row count shown when it stopped; current rows_read={rows_read})"
+        ) from e
+    except Exception as e:
+        err = type(e).__name__
+        if "RemoteProtocol" in err or "Connection" in err or "ChunkedEncoding" in err:
+            raise SystemExit(
+                f"Hub download interrupted ({e!r}).\n"
+                f"Re-run the same command and add:\n"
+                f"  --resume {rows_read}\n"
+                f"so streaming continues from Hub row index {rows_read} (append to {args.out}).\n"
+                "Tip: set HF_TOKEN for more stable downloads; consider writing --out on Google Drive."
+            ) from e
+        raise
+
+    print(
+        f"Wrote {args.out} ({args.out.stat().st_size} bytes, {n_non_empty:,} non-empty docs in this run)",
+        flush=True,
+    )
+    if resume:
+        print(f"(skipped first {resume:,} Hub rows; appended)", flush=True)
 
 
 if __name__ == "__main__":
