@@ -41,7 +41,13 @@ def _ids_to_storage_tensor(ids: list[int], vocab_size: int) -> torch.Tensor:
     return torch.tensor(ids, dtype=torch.int32)
 
 
-def encode_corpus_file_streaming(path: Path, tok: BPETokenizer) -> torch.Tensor:
+def encode_corpus_file_streaming(
+    path: Path,
+    tok: BPETokenizer,
+    *,
+    label: str = "corpus",
+    progress_interval_mb: int = 64,
+) -> torch.Tensor:
     """
     Stream a plaintext corpus from disk: never holds the full file as one string or Python list of all ids.
 
@@ -50,11 +56,32 @@ def encode_corpus_file_streaming(path: Path, tok: BPETokenizer) -> torch.Tensor:
     """
     out_h = array.array("H")
     buf = ""
+    total_bytes = path.stat().st_size
+    bytes_read = 0
+    docs_seen = 0
+    t0 = time.time()
+    interval_bytes = max(1, progress_interval_mb) * 1024 * 1024
+    next_report = interval_bytes
+
+    def _report(force: bool = False) -> None:
+        nonlocal next_report
+        if not force and bytes_read < next_report:
+            return
+        next_report += interval_bytes
+        elapsed = time.time() - t0
+        pct = (100.0 * bytes_read / total_bytes) if total_bytes > 0 else 100.0
+        print(
+            f"[encode:{label}] {pct:5.1f}%  {bytes_read/1e9:.2f}GB/{total_bytes/1e9:.2f}GB  "
+            f"docs={docs_seen:,}  elapsed={elapsed/60:.1f}m",
+            flush=True,
+        )
+
     with path.open("r", encoding="utf-8", errors="replace") as f:
         while True:
             chunk = f.read(2 * 1024 * 1024)
             if not chunk:
                 break
+            bytes_read += len(chunk.encode("utf-8", errors="ignore"))
             buf += chunk
             while True:
                 i = buf.find(EOT_STR)
@@ -68,12 +95,17 @@ def encode_corpus_file_streaming(path: Path, tok: BPETokenizer) -> torch.Tensor:
                         raise SystemExit("Token id >= 65536; use --full_ram_encode or smaller vocab.")
                     out_h.extend(piece)
                 out_h.append(tok.eot_token_id)
+                docs_seen += 1
+            _report()
         tail = buf.strip()
         if tail:
             piece = tok.encode(tail, add_eot_between_docs=False)
             if piece and max(piece) >= 65536:
                 raise SystemExit("Token id >= 65536; use --full_ram_encode or smaller vocab.")
             out_h.extend(piece)
+            docs_seen += 1
+
+    _report(force=True)
 
     return torch.tensor(out_h, dtype=torch.uint16)
 
@@ -191,6 +223,12 @@ def main() -> None:
         action="store_true",
         help="Load each corpus fully into RAM then encode (high memory; default streams from disk for lower RAM).",
     )
+    p.add_argument(
+        "--encode_progress_interval_mb",
+        type=int,
+        default=64,
+        help="Print streaming encode progress every N MB read (default: 64).",
+    )
     args = p.parse_args()
 
     torch.manual_seed(args.seed)
@@ -209,7 +247,12 @@ def main() -> None:
             "Encoding training corpus (streaming from disk, uint16 storage; use --full_ram_encode for legacy path)...",
             flush=True,
         )
-        token_ids = encode_corpus_file_streaming(args.corpus, tok)
+        token_ids = encode_corpus_file_streaming(
+            args.corpus,
+            tok,
+            label="train",
+            progress_interval_mb=args.encode_progress_interval_mb,
+        )
     print(f"Training sequence: {len(token_ids):,} token ids (dtype={token_ids.dtype})", flush=True)
     if len(token_ids) < args.context_length + 2:
         raise SystemExit("Training corpus is too small after tokenization.")
@@ -225,7 +268,12 @@ def main() -> None:
             gc.collect()
         else:
             print("Encoding validation corpus (streaming)...", flush=True)
-            eval_token_ids = encode_corpus_file_streaming(args.val_corpus, tok)
+            eval_token_ids = encode_corpus_file_streaming(
+                args.val_corpus,
+                tok,
+                label="val",
+                progress_interval_mb=args.encode_progress_interval_mb,
+            )
         if len(eval_token_ids) < args.context_length + 2:
             raise SystemExit("Validation corpus is too small after tokenization.")
         print(f"Validation: held-out file {args.val_corpus} ({len(eval_token_ids)} token ids)")
