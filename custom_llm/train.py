@@ -110,6 +110,71 @@ def encode_corpus_file_streaming(
     return torch.tensor(out_h, dtype=torch.uint16)
 
 
+def _load_token_ids_cache(path: Path) -> torch.Tensor:
+    try:
+        payload = torch.load(path, map_location="cpu", weights_only=False)
+    except TypeError:
+        payload = torch.load(path, map_location="cpu")
+    if isinstance(payload, torch.Tensor):
+        return payload
+    if isinstance(payload, dict) and isinstance(payload.get("token_ids"), torch.Tensor):
+        return payload["token_ids"]
+    raise SystemExit(f"Unsupported token-id cache format at {path}")
+
+
+def _save_token_ids_cache(path: Path, token_ids: torch.Tensor, *, source: Path, tok: BPETokenizer) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "token_ids": token_ids.cpu(),
+        "source_path": str(source),
+        "source_size_bytes": source.stat().st_size if source.exists() else None,
+        "vocab_size": tok.vocab_size,
+        "eot_token_id": tok.eot_token_id,
+    }
+    torch.save(payload, path)
+
+
+def _load_or_encode_token_ids(
+    corpus_path: Path,
+    tok: BPETokenizer,
+    *,
+    cache_path: Path | None,
+    rebuild_cache: bool,
+    full_ram_encode: bool,
+    encode_progress_interval_mb: int,
+    label: str,
+) -> torch.Tensor:
+    if cache_path is not None and cache_path.exists() and not rebuild_cache:
+        print(f"Loading cached {label} token ids: {cache_path}", flush=True)
+        token_ids = _load_token_ids_cache(cache_path)
+        print(f"Loaded cached {label} token ids: {len(token_ids):,} (dtype={token_ids.dtype})", flush=True)
+        return token_ids
+
+    print(f"Loading {label} text: {corpus_path}", flush=True)
+    if full_ram_encode:
+        text = load_corpus_text(corpus_path)
+        print(f"Encoding {label} corpus to token ids (large files can take a few minutes)...", flush=True)
+        token_ids = encode_corpus(tok, text)
+        del text
+        gc.collect()
+    else:
+        print(
+            f"Encoding {label} corpus (streaming from disk, uint16 storage; use --full_ram_encode for legacy path)...",
+            flush=True,
+        )
+        token_ids = encode_corpus_file_streaming(
+            corpus_path,
+            tok,
+            label=label,
+            progress_interval_mb=encode_progress_interval_mb,
+        )
+
+    if cache_path is not None:
+        print(f"Saving {label} token-id cache to: {cache_path}", flush=True)
+        _save_token_ids_cache(cache_path, token_ids, source=corpus_path, tok=tok)
+    return token_ids
+
+
 @torch.no_grad()
 def evaluate(
     model: TransformerLM,
@@ -229,51 +294,53 @@ def main() -> None:
         default=64,
         help="Print streaming encode progress every N MB read (default: 64).",
     )
+    p.add_argument(
+        "--train_ids_cache",
+        type=Path,
+        default=None,
+        help="Optional path to cache train token ids (.pt). Greatly reduces startup on subsequent runs.",
+    )
+    p.add_argument(
+        "--val_ids_cache",
+        type=Path,
+        default=None,
+        help="Optional path to cache validation token ids (.pt).",
+    )
+    p.add_argument(
+        "--rebuild_ids_cache",
+        action="store_true",
+        help="Force re-encode corpus and overwrite token-id caches.",
+    )
     args = p.parse_args()
 
     torch.manual_seed(args.seed)
     device = torch.device(args.device)
 
     tok = BPETokenizer.load(args.tokenizer_dir)
-    print(f"Loading training text: {args.corpus}", flush=True)
-    if args.full_ram_encode:
-        text = load_corpus_text(args.corpus)
-        print("Encoding training corpus to token ids (large files can take a few minutes)...", flush=True)
-        token_ids = encode_corpus(tok, text)
-        del text
-        gc.collect()
-    else:
-        print(
-            "Encoding training corpus (streaming from disk, uint16 storage; use --full_ram_encode for legacy path)...",
-            flush=True,
-        )
-        token_ids = encode_corpus_file_streaming(
-            args.corpus,
-            tok,
-            label="train",
-            progress_interval_mb=args.encode_progress_interval_mb,
-        )
+    token_ids = _load_or_encode_token_ids(
+        args.corpus,
+        tok,
+        cache_path=args.train_ids_cache,
+        rebuild_cache=args.rebuild_ids_cache,
+        full_ram_encode=args.full_ram_encode,
+        encode_progress_interval_mb=args.encode_progress_interval_mb,
+        label="train",
+    )
     print(f"Training sequence: {len(token_ids):,} token ids (dtype={token_ids.dtype})", flush=True)
     if len(token_ids) < args.context_length + 2:
         raise SystemExit("Training corpus is too small after tokenization.")
 
     eval_token_ids = token_ids
     if args.val_corpus is not None:
-        print(f"Loading validation text: {args.val_corpus}", flush=True)
-        if args.full_ram_encode:
-            val_text = load_corpus_text(args.val_corpus)
-            print("Encoding validation corpus to token ids...", flush=True)
-            eval_token_ids = encode_corpus(tok, val_text)
-            del val_text
-            gc.collect()
-        else:
-            print("Encoding validation corpus (streaming)...", flush=True)
-            eval_token_ids = encode_corpus_file_streaming(
-                args.val_corpus,
-                tok,
-                label="val",
-                progress_interval_mb=args.encode_progress_interval_mb,
-            )
+        eval_token_ids = _load_or_encode_token_ids(
+            args.val_corpus,
+            tok,
+            cache_path=args.val_ids_cache,
+            rebuild_cache=args.rebuild_ids_cache,
+            full_ram_encode=args.full_ram_encode,
+            encode_progress_interval_mb=args.encode_progress_interval_mb,
+            label="val",
+        )
         if len(eval_token_ids) < args.context_length + 2:
             raise SystemExit("Validation corpus is too small after tokenization.")
         print(f"Validation: held-out file {args.val_corpus} ({len(eval_token_ids)} token ids)")
