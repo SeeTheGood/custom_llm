@@ -21,4 +21,4 @@ dev = ["pytest>=7.0"]
 
 [tool.setuptools.packages.find]
 where = ["."]
-include = ["custom_llm*"]
+include = ["llm*"]

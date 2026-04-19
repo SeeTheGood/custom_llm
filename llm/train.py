@@ -15,10 +15,10 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader
 from tqdm.auto import tqdm
 
-from custom_llm.bpe_trainer import EOT_STR
-from custom_llm.data import SlidingWindowDataset
-from custom_llm.model import TransformerConfig, TransformerLM
-from custom_llm.tokenizer import BPETokenizer
+from llm.bpe_trainer import EOT_STR
+from llm.data import SlidingWindowDataset
+from llm.model import TransformerConfig, TransformerLM
+from llm.tokenizer import BPETokenizer
 
 
 def load_corpus_text(path: Path) -> str:

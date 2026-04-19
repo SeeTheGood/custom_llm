@@ -1,4 +1,4 @@
-# custom_llm
+# custom-llm
 
 Build a small decoder-only Transformer LM from scratch on CPU: **GPT-2 regex pretokenization → byte-level BPE (10k vocab, `<|endoftext|>`) → Transformer → training → sampling**.
 
@@ -54,7 +54,7 @@ Low-resource shape from the spec:
 - Target validation loss **≤ 2.00** (may require tuning LR / warmup on your machine)
 
 ```bash
-python -m custom_llm.train \
+python -m llm.train \
   --corpus data/tinystories_val.txt \
   --tokenizer_dir tokenizer \
   --out_dir checkpoints \
@@ -67,7 +67,7 @@ python -m custom_llm.train \
 **Held-out validation (recommended):** prepare `data/tinystories_train.txt` and `data/tinystories_val.txt`, train the tokenizer on **train**, then:
 
 ```bash
-python -m custom_llm.train \
+python -m llm.train \
   --corpus data/tinystories_train.txt \
   --val_corpus data/tinystories_val.txt \
   --tokenizer_dir tokenizer \
@@ -86,7 +86,7 @@ Checkpoints: `checkpoints/best.pt` (lowest **held-out** validation loss if `--va
 ### 4. Sample
 
 ```bash
-python -m custom_llm.sample \
+python -m llm.sample \
   --checkpoint checkpoints/best.pt \
   --tokenizer_dir tokenizer \
   --prompt "Once upon a time" \
@@ -99,14 +99,14 @@ Use `--top_p 0.9 --temperature 0.9` for nucleus sampling.
 
 | Module | Role |
 |--------|------|
-| `custom_llm/gpt2_pretokenize.py` | GPT-2 pretokenizer regex |
-| `custom_llm/bpe_trainer.py` | Byte-level BPE merge training |
-| `custom_llm/tokenizer.py` | `BPETokenizer` encode/decode + `tokenizer.json` I/O |
-| `custom_llm/model.py` | Causal Transformer + RoPE, weight-tied head |
-| `custom_llm/data.py` | Random sliding windows over token ids |
-| `custom_llm/train.py` | Training loop (CPU or CUDA) |
-| `custom_llm/sample.py` | Greedy or top-p generation |
-| `custom_llm/pretokenization.py` | Optional parallel chunking for huge files |
+| `llm/gpt2_pretokenize.py` | GPT-2 pretokenizer regex |
+| `llm/bpe_trainer.py` | Byte-level BPE merge training |
+| `llm/tokenizer.py` | `BPETokenizer` encode/decode + `tokenizer.json` I/O |
+| `llm/model.py` | Causal Transformer + RoPE, weight-tied head |
+| `llm/data.py` | Random sliding windows over token ids |
+| `llm/train.py` | Training loop (CPU or CUDA) |
+| `llm/sample.py` | Greedy or top-p generation |
+| `llm/pretokenization.py` | Optional parallel chunking for huge files |
 
 ## Tests
 

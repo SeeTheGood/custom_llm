@@ -2,7 +2,7 @@
 
 from pathlib import Path
 
-from custom_llm.pretokenization import find_chunk_boundaries, iter_text_chunks
+from llm.pretokenization import find_chunk_boundaries, iter_text_chunks
 
 
 def test_find_chunk_boundaries_on_delimiter(tmp_path: Path) -> None:

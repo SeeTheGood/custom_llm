@@ -6,8 +6,8 @@ import json
 from pathlib import Path
 from typing import Any
 
-from custom_llm.bpe_trainer import EOT_STR
-from custom_llm.gpt2_pretokenize import pretokenize
+from llm.bpe_trainer import EOT_STR
+from llm.gpt2_pretokenize import pretokenize
 
 
 def _encode_piece(merge_rank: dict[tuple[int, int], int], piece: tuple[int, ...]) -> list[int]:

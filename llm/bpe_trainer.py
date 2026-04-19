@@ -8,7 +8,7 @@ from typing import Iterable
 
 from tqdm.auto import tqdm
 
-from custom_llm.gpt2_pretokenize import pretokenize
+from llm.gpt2_pretokenize import pretokenize
 
 EOT_STR = "<|endoftext|>"
 

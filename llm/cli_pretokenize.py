@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import argparse
 
-from custom_llm.pretokenization import iter_text_chunks
+from llm.pretokenization import iter_text_chunks
 
 
 def main() -> None:

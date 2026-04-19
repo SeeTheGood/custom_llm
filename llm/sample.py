@@ -8,9 +8,9 @@ from pathlib import Path
 import torch
 import torch.nn.functional as F
 
-from custom_llm.bpe_trainer import EOT_STR
-from custom_llm.model import TransformerConfig, TransformerLM
-from custom_llm.tokenizer import BPETokenizer
+from llm.bpe_trainer import EOT_STR
+from llm.model import TransformerConfig, TransformerLM
+from llm.tokenizer import BPETokenizer
 
 
 @torch.no_grad()

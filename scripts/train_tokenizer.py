@@ -11,8 +11,8 @@ _ROOT = Path(__file__).resolve().parents[1]
 if str(_ROOT) not in sys.path:
     sys.path.insert(0, str(_ROOT))
 
-from custom_llm.bpe_trainer import train_bpe_from_text
-from custom_llm.tokenizer import BPETokenizer
+from llm.bpe_trainer import train_bpe_from_text
+from llm.tokenizer import BPETokenizer
 
 
 def main() -> None:
