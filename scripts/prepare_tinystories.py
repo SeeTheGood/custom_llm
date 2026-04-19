@@ -4,6 +4,8 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
+import re
 import sys
 from pathlib import Path
 
@@ -15,6 +17,16 @@ from datasets import load_dataset
 from tqdm.auto import tqdm
 
 EOT = "<|endoftext|>"
+
+
+def _normalize_for_dedupe(text: str) -> str:
+    t = text.strip()
+    t = re.sub(r"\s+", " ", t)
+    return t
+
+
+def _doc_fingerprint(text: str) -> bytes:
+    return hashlib.sha256(_normalize_for_dedupe(text).encode("utf-8")).digest()
 
 
 def _apply_resume(ds, resume: int, streaming: bool):
@@ -62,10 +74,23 @@ def main() -> None:
         default=5000,
         help="Flush the output file every N rows read (0 = flush only at end). Reduces loss on crash.",
     )
+    p.add_argument(
+        "--dedupe",
+        action="store_true",
+        help="Skip stories whose normalized text was already written (exact duplicates in this run). "
+        "Uses extra RAM (~32 bytes per unique story hash). "
+        "Does not read an existing --out file: if you use --resume, run scripts/clean_eot_corpus.py once on the final file.",
+    )
     args = p.parse_args()
 
     streaming = not args.no_streaming
     resume = max(0, args.resume)
+    if resume and args.dedupe:
+        print(
+            "Note: --dedupe only applies to rows in this run; for global dedupe after --resume, "
+            "run: python scripts/clean_eot_corpus.py --in <out> --out <out.clean>",
+            flush=True,
+        )
     print(
         f"Loading roneneldan/TinyStories split={args.split!r} streaming={streaming} resume={resume} ...",
         flush=True,
@@ -79,7 +104,9 @@ def main() -> None:
     args.out.parent.mkdir(parents=True, exist_ok=True)
     mode = "a" if resume > 0 else "w"
     n_non_empty = 0
+    n_skipped_dup = 0
     rows_read = resume
+    seen_hashes: set[bytes] = set()
     try:
         with args.out.open(mode, encoding="utf-8") as f:
             it = tqdm(
@@ -95,6 +122,14 @@ def main() -> None:
                     if args.flush_every and rows_read % args.flush_every == 0:
                         f.flush()
                     continue
+                if args.dedupe:
+                    fp = _doc_fingerprint(text)
+                    if fp in seen_hashes:
+                        n_skipped_dup += 1
+                        if args.flush_every and rows_read % args.flush_every == 0:
+                            f.flush()
+                        continue
+                    seen_hashes.add(fp)
                 f.write(text)
                 f.write("\n\n")
                 f.write(EOT)
@@ -124,6 +159,8 @@ def main() -> None:
         f"Wrote {args.out} ({args.out.stat().st_size} bytes, {n_non_empty:,} non-empty docs in this run)",
         flush=True,
     )
+    if args.dedupe and n_skipped_dup:
+        print(f"(dedupe: skipped {n_skipped_dup:,} duplicate stories in Hub order)", flush=True)
     if resume:
         print(f"(skipped first {resume:,} Hub rows; appended)", flush=True)
 

@@ -1,4 +1,8 @@
 .venv/
+.DS_Store
+checkpoints/
+data/*.txt
+data/*.bin
 __pycache__/
 *.py[cod]
 .pytest_cache/
