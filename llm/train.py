@@ -6,6 +6,7 @@ import argparse
 import array
 import gc
 import math
+import os
 import sys
 import time
 from pathlib import Path
@@ -19,6 +20,19 @@ from llm.bpe_trainer import EOT_STR
 from llm.data import SlidingWindowDataset
 from llm.model import TransformerConfig, TransformerLM
 from llm.tokenizer import BPETokenizer
+
+
+def _use_tqdm_progress(*, no_progress: bool, force_tqdm: bool) -> bool:
+    """Use tqdm in real terminals, or in Colab / Jupyter where cell output still updates."""
+    if no_progress:
+        return False
+    if force_tqdm:
+        return True
+    if sys.stdout.isatty():
+        return True
+    if os.environ.get("COLAB_RELEASE_TAG") or os.environ.get("JPY_PARENT_PID"):
+        return True
+    return False
 
 
 def load_corpus_text(path: Path) -> str:
@@ -107,7 +121,23 @@ def encode_corpus_file_streaming(
 
     _report(force=True)
 
-    return torch.tensor(out_h, dtype=torch.uint16)
+    n_tok = len(out_h)
+    print(
+        f"[encode:{label}] file read + tokenize done; building torch tensor for {n_tok:,} tokens "
+        f"(this step can take several minutes on large corpora; CPU may look idle in monitors)...",
+        flush=True,
+    )
+    t_conv = time.time()
+    # Faster and usually lower peak RAM than torch.tensor(out_h) on huge array.array.
+    token_ids = torch.frombuffer(memoryview(out_h), dtype=torch.uint16).clone()
+    del out_h
+    gc.collect()
+    print(
+        f"[encode:{label}] tensor ready in {time.time() - t_conv:.1f}s "
+        f"(dtype={token_ids.dtype}, numel={token_ids.numel():,})",
+        flush=True,
+    )
+    return token_ids
 
 
 def _load_token_ids_cache(path: Path) -> torch.Tensor:
@@ -447,10 +477,8 @@ def main() -> None:
 
     last_val = best_val
 
-    # Colab/Jupyter `!python` runs a non-TTY subprocess: tqdm's \\r updates are often buffered
-    # until the process ends. Prefer flushed line prints unless we're in a real terminal.
-    _tty = sys.stdout.isatty()
-    use_tqdm_loop = (not args.no_progress) and (_tty or args.force_tqdm)
+    # Prefer tqdm in Colab/Jupyter too (matches notebook cell output like the reference logs).
+    use_tqdm_loop = _use_tqdm_progress(no_progress=args.no_progress, force_tqdm=args.force_tqdm)
     use_simple_lines = (not args.no_progress) and (not use_tqdm_loop)
 
     if use_tqdm_loop:
@@ -467,11 +495,12 @@ def main() -> None:
         train_iter = range(1, args.steps + 1)
         if use_simple_lines:
             print(
-                f"Progress: printing every {args.progress_interval} steps (non-TTY / Colab-friendly). "
-                "Use a real terminal or --force_tqdm for tqdm.",
+                f"Progress: printing every {args.progress_interval} steps (no TTY / no notebook). "
+                "Pass --force_tqdm to use tqdm anyway.",
                 flush=True,
             )
 
+    last_avg50: float | None = None
     for local_i in train_iter:
         step = resume_from + local_i
         for g in opt.param_groups:
@@ -498,12 +527,6 @@ def main() -> None:
         opt.zero_grad(set_to_none=True)
 
         running_loss += loss.item()
-        if use_tqdm_loop:
-            train_iter.set_postfix(
-                batch_loss=f"{loss.item():.3f}",
-                lr=f"{opt.param_groups[0]['lr']:.1e}",
-                step=f"{step}/{global_total}",
-            )
 
         if use_simple_lines and (
             local_i % args.progress_interval == 0
@@ -524,20 +547,14 @@ def main() -> None:
             avg = running_loss / 50
             running_loss = 0.0
             elapsed = time.time() - t0
+            last_avg50 = avg
             if args.no_progress:
                 print(
                     f"step {step}/{global_total}  loss {avg:.4f}  lr {opt.param_groups[0]['lr']:.2e}  "
                     f"elapsed {elapsed/60:.1f}m",
                     flush=True,
                 )
-            elif use_tqdm_loop:
-                train_iter.set_postfix(
-                    avg50=f"{avg:.4f}",
-                    lr=f"{opt.param_groups[0]['lr']:.2e}",
-                    elapsed_min=f"{elapsed/60:.1f}",
-                    step=f"{step}/{global_total}",
-                )
-            else:
+            elif not use_tqdm_loop:
                 bar = _ascii_progress_bar(local_i, args.steps, width=max(8, args.bar_width))
                 pct = 100.0 * local_i / args.steps
                 print(
@@ -545,6 +562,16 @@ def main() -> None:
                     f"lr={opt.param_groups[0]['lr']:.2e}  elapsed={elapsed/60:.1f}m",
                     flush=True,
                 )
+
+        if use_tqdm_loop:
+            elapsed = time.time() - t0
+            train_iter.set_postfix(
+                avg50=f"{last_avg50:.4f}" if last_avg50 is not None else "---",
+                elapsed_min=f"{elapsed / 60:.1f}",
+                lr=f"{opt.param_groups[0]['lr']:.2e}",
+                step=f"{step}/{global_total}",
+                refresh=False,
+            )
 
         if step % args.eval_every == 0 or local_i == args.steps:
             if use_simple_lines:
