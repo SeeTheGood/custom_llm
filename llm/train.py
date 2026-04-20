@@ -22,6 +22,53 @@ from llm.model import TransformerConfig, TransformerLM
 from llm.tokenizer import BPETokenizer
 
 
+def _ensure_device_ready(device: torch.device) -> None:
+    """Fail fast if CUDA was requested but is missing or misconfigured (before long corpus encode)."""
+    if device.type != "cuda":
+        return
+    if not torch.cuda.is_available():
+        raise SystemExit(
+            "You passed --device cuda, but torch.cuda.is_available() is False.\n"
+            "In Colab: Runtime → Change runtime type → GPU, then reconnect and re-run from the top."
+        )
+    idx = device.index if device.index is not None else 0
+    n = torch.cuda.device_count()
+    if idx < 0 or idx >= n:
+        raise SystemExit(f"Invalid CUDA device index {idx} (torch sees {n} GPU(s)). Try --device cuda:0.")
+
+
+def _log_cuda_memory(prefix: str = "") -> None:
+    if not torch.cuda.is_available():
+        return
+    p = f"{prefix} " if prefix else ""
+    try:
+        free_b, total_b = torch.cuda.mem_get_info()  # type: ignore[attr-defined]
+    except Exception:
+        return
+    print(
+        f"[cuda]{p}device={torch.cuda.current_device()}  "
+        f"mem_free={free_b / 1e9:.2f}GB  mem_total={total_b / 1e9:.2f}GB",
+        flush=True,
+    )
+
+
+def _warmup_cuda(device: torch.device) -> None:
+    """Force CUDA driver init + a minimal alloc before long CPU encode (fail fast if GPU is unusable)."""
+    if device.type != "cuda":
+        return
+    try:
+        x = torch.zeros(1, device=device)
+        torch.cuda.synchronize()
+        del x
+        torch.cuda.empty_cache()
+    except Exception as e:
+        raise SystemExit(
+            "CUDA warmup failed (could not allocate a 1-element tensor on GPU).\n"
+            f"Detail: {e!r}\n"
+            "In Colab: Runtime → Restart runtime, ensure Runtime type is GPU, run `!nvidia-smi`, then retry."
+        ) from e
+
+
 def _use_tqdm_progress(*, no_progress: bool, force_tqdm: bool) -> bool:
     """Use tqdm in real terminals, or in Colab / Jupyter where cell output still updates."""
     if no_progress:
@@ -345,6 +392,8 @@ def main() -> None:
 
     torch.manual_seed(args.seed)
     device = torch.device(args.device)
+    _ensure_device_ready(device)
+    _warmup_cuda(device)
 
     tok = BPETokenizer.load(args.tokenizer_dir)
     token_ids = _load_or_encode_token_ids(
@@ -386,6 +435,12 @@ def main() -> None:
         d_ff=1344,
         dropout=0.1,
     )
+    # Embedding dominates params; absurd vocab_size here usually means a bad tokenizer.json.
+    print(
+        f"Model config: vocab_size={cfg.vocab_size:,}  context_length={cfg.context_length}  "
+        f"(embedding rows alone ≈ {cfg.vocab_size * cfg.d_model * 4 / 1e6:.1f}M float32 params)",
+        flush=True,
+    )
 
     resume_from = 0
     resume_ckpt: dict | None = None
@@ -402,7 +457,25 @@ def main() -> None:
         resume_from = int(resume_ckpt.get("step", 0))
         print(f"Resuming from step {resume_from} (will run {args.steps} more steps → up to {resume_from + args.steps})")
 
-    model = TransformerLM(cfg).to(device)
+    gc.collect()
+    if device.type == "cuda":
+        torch.cuda.empty_cache()
+        _log_cuda_memory("before model.to(device)")
+
+    try:
+        model = TransformerLM(cfg).to(device)
+    except RuntimeError as e:
+        msg = str(e).lower()
+        if device.type == "cuda" and ("out of memory" in msg or "cuda" in msg):
+            _log_cuda_memory("after OOM")
+            raise SystemExit(
+                f"Failed to move the model to GPU ({e!r}).\n"
+                "This is unusual for a ~17M-parameter model; often another process is using VRAM.\n"
+                "Try: restart the Colab runtime, run only this notebook, then `!nvidia-smi` before training.\n"
+                "Workaround: train on CPU with `--device cpu` (much slower)."
+            ) from e
+        raise
+
     if resume_ckpt is not None:
         model.load_state_dict(resume_ckpt["model_state"])
     n_params = model.count_parameters()
