@@ -14,7 +14,6 @@ cd custom_llm
 | Remote | URL |
 |--------|-----|
 | **origin** | https://github.com/SeeTheGood/custom_llm.git |
-| **enterprise** | https://github.com/SeeTheGood/enterprise_llm.git |
 
 Large artifacts (corpora, checkpoints, token caches) are **not** committed. See [`.gitignore`](.gitignore).
 
